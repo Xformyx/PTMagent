@@ -1,0 +1,62 @@
+# OpenClaw-Home 설정 예시
+# 이 파일을 config.yaml로 복사 후 값을 채우세요: cp config.example.yaml config.yaml
+
+telegram:
+  token: "YOUR_TELEGRAM_BOT_TOKEN"
+  allowed_user_ids:
+    - 12345678
+  # 수신 로그 (stderr / docker logs 로 확인). 일반 채팅까지 남기려면 log_messages: true
+  log_commands: true
+  log_messages: false
+  # log_level: "INFO"
+
+ollama:
+  model: "gemma3:27b"
+  # 로컬: localhost / Docker에서 호스트 Ollama: http://host.docker.internal:11434
+  # 컨테이너에서는 환경변수 OLLAMA_BASE_URL 이 있으면 여기보다 우선합니다.
+  base_url: "http://localhost:11434"
+
+scheduler:
+  admission_check: "0 9 * * *"
+
+admission:
+  univ_sources: []
+
+# 번역 프롬프트
+translator:
+  zh_to_ko: |
+    다음 중국어 텍스트를 자연스러운 대화체 한국어로 번역해주세요.
+    규칙:
+    - 번역은 구어체/대화체로 자연스럽게.
+    - 주요 단어(핵심 어휘)는 괄호 안에 한어병음과 뜻을 함께 표기. 예: 糊塗(hútu, 어리석다)
+    - 번역만 출력하고 다른 설명은 하지 마세요.
+  ko_to_zh: |
+    다음 한국어 텍스트를 자연스러운 중국어(간체)로 번역해주세요.
+    번역만 출력하고 다른 설명은 하지 마세요.
+
+# Threads: /threads 수동 명령용 (자동 체크 없음)
+threads:
+  search_query: "權喜原"  # 또는 username: "@username" (프로필 직접)
+
+# PTM Platform webhook 수신
+webhook:
+  enabled: true
+  port: 9000
+  notify_telegram_ids: [12345678]
+
+# PTM 플랫폼 (Mac Studio에서 실행)
+# Docker 실행 시: docker-compose 가 OPENCLAW_PTM_PLATFORM_PATH=/ptm-platform 등 설정 + 볼륨 마운트
+#   (이 파일의 ~ 경로는 로컬 전용; 컨테이너에서는 환경 변수가 우선)
+ptm:
+  project_path: "~/Documents/Work/PTM/ptm-platform"
+  # PTMQuant 루트: /ptmquant_pull 및 /ptmquant_build 가 여기서 동작
+  # ptmquant_git_path: "~/Documents/Work/PTM/PTMQuant"
+  # git_path 없을 때만 쓰는 대체 경로 (봇 루트 등):
+  # ptmquant_project_path: "/app"
+  # compose 의 services 이름과 동일해야 함 (docker compose config --services 로 확인)
+  # 이 저장소(openclaw-home)만 쓰면 기본값이 myagent 로 맞춰짐
+  # ptmquant_service_name: "myagent"
+  worker_containers:
+    preprocessing: ptm-worker-preprocessing
+    rag: ptm-worker-rag
+    report: ptm-worker-report

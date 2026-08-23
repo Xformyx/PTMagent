@@ -1,0 +1,52 @@
+# OpenClaw-Home 컨테이너 실행
+#
+# 준비: 이 디렉터리의 config.yaml (토큰 등), 호스트에서 Ollama 가동 권장
+#
+# 실행:
+#   docker compose up -d --build
+#
+# 로그:
+#   docker compose logs -f
+#
+# Ollama가 같은 맥의 호스트에서 돌 때는 아래 OLLAMA_BASE_URL 유지.
+# Linux 네이티브 Docker에서는 extra_hosts 로 host.docker.internal 이 필요할 수 있음.
+#
+# docker.sock: 컨테이너 안에서 docker compose 사용 (/ptmquant_build 등)
+#
+# /app: openclaw-home. /ptm-platform: PTM 플랫폼 — /git_pull, /shell, 배포 스크립트
+# /PTMQuant: /ptmquant_pull · /ptmquant_build
+# PTM_PLATFORM_REPO / PTMQUANT_REPO 로 호스트 경로 변경 가능
+#
+# private GitHub 가 HTTPS(origin)이면 컨테이너에서 자격 증명 입력 불가 → SSH origin + 아래 한 줄 주석 해제 권장:
+#   - ${HOME}/.ssh:/root/.ssh:ro
+
+name: openclaw-home
+
+services:
+  myagent:
+    build: .
+    image: myagent:latest
+    restart: unless-stopped
+    ports:
+      - "${WEBHOOK_PORT:-9000}:9000"
+    volumes:
+      - .:/app
+      - ${PTM_PLATFORM_REPO:-${HOME}/Documents/Work/PTM/ptm-platform}:/ptm-platform:rw
+      - ${PTMQUANT_REPO:-${HOME}/Documents/Work/PTM/PTMQuant}:/PTMQuant:rw
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${HOME}/.ssh:/root/.ssh:ro
+    environment:
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      # 컨테이너 안 경로(호스트 폴더는 위 volumes 와 동일 트리)
+      OPENCLAW_PTM_PLATFORM_PATH: /ptm-platform
+      OPENCLAW_PTM_SHELL_CWD: /ptm-platform
+      OPENCLAW_PTMQUANT_GIT_PATH: /PTMQuant
+      # docker compose 가 볼륨 상대경로를 해석할 때 쓰는 호스트 실제 경로
+      PTM_PLATFORM_HOST_PATH: ${PTM_PLATFORM_REPO:-${HOME}/Documents/Work/PTM/ptm-platform}
+      PTM_QUANT_HOST_PATH: ${PTMQUANT_REPO:-${HOME}/Documents/Work/PTM/PTMQuant}
+      # SSH 키 권한이 macOS→Linux 마운트에서 틀어지는 문제 우회
+      GIT_SSH_COMMAND: ssh -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -i /root/.ssh/id_ed25519_macstudio
+      # 컨테이너 안 docker build 기본 플랫폼: Apple Silicon 에서 x86_64 이미지 빌드용
+      DOCKER_DEFAULT_PLATFORM: linux/amd64
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

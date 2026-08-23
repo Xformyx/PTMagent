@@ -1,0 +1,29 @@
+# OpenClaw-Home 의존성
+# Python 3.10+ 권장
+
+# LLM & Agent
+langchain>=0.3
+langchain-community>=0.3
+langchain-core>=0.3
+
+# Telegram
+python-telegram-bot>=21.0
+
+# 웹 스크래핑
+playwright>=1.40
+httpx>=0.27
+aiohttp>=3.9
+
+# 스케줄러
+apscheduler>=3.10
+
+# 설정
+pyyaml>=6.0
+
+# PDF 파싱
+pypdf>=4.0
+
+# RAG (ChromaDB 대신 FAISS 사용 - 호환성 이슈 회피)
+faiss-cpu>=1.7
+# nomic-embed-text: Ollama에서 별도 설치 필요
+# ollama pull nomic-embed-text

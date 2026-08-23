@@ -1,0 +1,26 @@
+# 설정 (토큰 포함)
+config.yaml
+
+# 데이터
+data/student_info.json
+data/instagram_history.json
+data/mes_board_state.json
+data/threads_state.json
+data/univ_cache/*.pdf
+data/univ_cache/_manifest.json
+data/vectorstore/
+
+# 로그
+logs/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+*.egg-info/
+
+# IDE
+.idea/
+.vscode/
