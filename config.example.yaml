@@ -16,8 +16,9 @@ ollama:
   # 컨테이너에서는 환경변수 OLLAMA_BASE_URL 이 있으면 여기보다 우선합니다.
   base_url: "http://localhost:11434"
 
+# 입시 PDF 크롤. 비우면 꺼짐. 켤 때 예: "0 9 * * *"
 scheduler:
-  admission_check: "0 9 * * *"
+  admission_check: ""
 
 admission:
   univ_sources: []

@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 import asyncio
+import fcntl
 import logging
 import os
 from html import escape
@@ -69,6 +70,33 @@ def is_allowed(user_id: int) -> bool:
     return user_id in ALLOWED_IDS
 
 
+INSTANCE_PID_FILE = Path("/tmp/ptm_agent.pid")
+_INSTANCE_LOCK_FD: int | None = None
+
+
+def _acquire_single_instance_lock() -> None:
+    """같은 토큰으로 두 프로세스가 뜨면 getUpdates Conflict. flock + PID 파일로 하나만 허용."""
+    global _INSTANCE_LOCK_FD
+    fd = os.open(str(INSTANCE_PID_FILE), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        other = ""
+        try:
+            other = os.read(fd, 64).decode("utf-8", errors="replace").strip()
+        except Exception:
+            pass
+        os.close(fd)
+        extra = f" (PID {other})" if other else ""
+        print(f"❌ 이미 봇이 실행 중입니다{extra}. 하나만 실행하세요.")
+        sys.exit(1)
+    os.ftruncate(fd, 0)
+    os.write(fd, f"{os.getpid()}\n".encode())
+    # fd 를 열어 둔 채로 유지해야 flock 이 유지된다. 파일은 지우지 않는다
+    # (unlink 하면 다른 프로세스가 새 inode 에 락을 잡을 수 있음).
+    _INSTANCE_LOCK_FD = fd
+
+
 async def _telegram_reply_long_pre(message, text: str, chunk: int = 3200) -> None:
     """docker 로그 등 특수문자 많은 긴 텍스트를 Markdown 없이 전송 (HTML pre)."""
     if not text:
@@ -104,17 +132,18 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 HELP_TEXT = """👋 PTM Agent
 
-*ptm-platform*
+<b>ptm-platform</b>
 • /ptmplatform_deploy — pull + 스마트 빌드, 양쪽 결과 알림
 • /ptmplatform_status — git·컨테이너·락 상태 확인
-• /ptmplatform_unlock — 배포 락 강제 해제 (비상용)
+• /ptmplatform_unlock — 배포 락 강제 해제
+• /ptmplatform_unlock quant — PTMQuant 락 해제
 
-*PTMQuant*
+<b>PTMQuant</b>
 • /ptmquant_deploy — pull + build
 
-*범용*
+<b>범용</b>
 • /latest — ptm-platform · PTMQuant 최근 커밋 10개
-• /shell <명령어> — Mac Studio 쉘 명령
+• /shell &lt;명령어&gt; — Mac Studio 쉘 명령 (최대 15분)
   예) /shell ./scripts/dev-deploy.sh --all
   예) /shell docker compose restart gateway"""
 
@@ -148,6 +177,7 @@ async def cmd_shell(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Docker 의 OPENCLAW_PTM_SHELL_CWD 를 확인하세요."
         )
         return
+    proc = None
     try:
         proc = await asyncio.create_subprocess_shell(
             cmd,
@@ -155,18 +185,19 @@ async def cmd_shell(update: Update, context: ContextTypes.DEFAULT_TYPE):
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=900)
         output = out.decode("utf-8", errors="replace").strip()
         rc = proc.returncode
-        result = output if output else "(출력 없음)"
         header = f"✅ 완료 (rc={rc})" if rc == 0 else f"❌ 실패 (rc={rc})"
-        # Telegram 메시지는 4096자 제한
-        for i in range(0, min(len(result), 12000), 3800):
-            chunk = result[i:i + 3800]
-            prefix = f"{header}\n```\n" if i == 0 else "```\n"
-            await update.message.reply_text(f"{prefix}{chunk}\n```", parse_mode="Markdown")
+        body = output if output else "(출력 없음)"
+        await _telegram_reply_long_pre(update.message, f"{header}\n{body}")
     except asyncio.TimeoutError:
-        await update.message.reply_text("❌ 60초 타임아웃 초과")
+        if proc is not None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        await update.message.reply_text("❌ 15분 타임아웃 초과")
     except Exception as e:
         await update.message.reply_text(f"오류: {str(e)[:500]}")
 
@@ -175,14 +206,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         await update.message.reply_text("⚠️ 사용 권한이 없습니다.")
         return
-    await update.message.reply_text(HELP_TEXT)
+    await update.message.reply_text(HELP_TEXT, parse_mode="HTML")
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         await update.message.reply_text("⚠️ 이 봇은 등록된 가족만 사용할 수 있습니다.")
         return
-    await update.message.reply_text(HELP_TEXT)
+    await update.message.reply_text(HELP_TEXT, parse_mode="HTML")
 
 
 async def cmd_latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -241,46 +272,6 @@ def _ptmquant_host_path() -> str:
     return (os.environ.get("PTM_QUANT_HOST_PATH") or "").strip() or _ptmquant_path()
 
 
-# ── 공통 실행 헬퍼 ─────────────────────────────────────────────────────────────
-
-async def _run_in_path(
-    update: Update,
-    path: str,
-    script: str,
-    desc: str,
-    timeout: int = 600,
-    compose_project_dir: str = "",
-) -> None:
-    """path 에서 script 실행 후 결과를 텔레그램으로 전송.
-    compose_project_dir: docker compose 볼륨 경로 기준 디렉터리 (호스트 실제 경로).
-    """
-    if not path or not Path(path).exists():
-        await update.message.reply_text(f"❌ 경로가 없습니다: {path or '(미설정)'}")
-        return
-    await update.message.reply_text(f"{desc} 실행 중…\n📁 {path}")
-    try:
-        from tools.ptm import run_script
-        # COMPOSE_PROJECT_DIR 을 호스트 경로로 주입 → docker compose 볼륨 상대경로 정상 해석
-        env_prefix = f'COMPOSE_PROJECT_DIR="{compose_project_dir}" ' if compose_project_dir else ""
-        msg, _ = await run_script(path, env_prefix + script, timeout=timeout)
-        await _telegram_reply_long_pre(update.message, msg)
-    except Exception as e:
-        await update.message.reply_text(f"오류: {str(e)[:500]}")
-
-
-async def _pull_in_path(update: Update, path: str, desc: str) -> None:
-    if not path or not Path(path).exists():
-        await update.message.reply_text(f"❌ 경로가 없습니다: {path or '(미설정)'}")
-        return
-    await update.message.reply_text(f"{desc} git pull 실행 중…\n📁 {path}")
-    try:
-        from tools.ptm import git_pull_only
-        msg, _ = await git_pull_only(path)
-        await update.message.reply_text(msg[:4000])
-    except Exception as e:
-        await update.message.reply_text(f"오류: {str(e)[:500]}")
-
-
 # ── 명령 핸들러 ────────────────────────────────────────────────────────────────
 
 def _user_display_name(update: Update) -> str:
@@ -294,12 +285,21 @@ def _user_display_name(update: Update) -> str:
 
 
 async def _broadcast(app_or_bot, text: str, exclude_id: int | None = None) -> None:
-    """허용된 모든 사용자에게 메시지 전송 (exclude_id 제외 가능)."""
+    """허용된 모든 사용자에게 HTML <pre>로 전송 (특수문자 파싱 실패 방지)."""
+    if not text:
+        return
+    chunk = 3200
     for uid in ALLOWED_IDS:
         if uid == exclude_id:
             continue
         try:
-            await app_or_bot.send_message(chat_id=uid, text=text, parse_mode="Markdown")
+            for i in range(0, len(text), chunk):
+                part = text[i : i + chunk]
+                await app_or_bot.send_message(
+                    chat_id=uid,
+                    text=f"<pre>{escape(part)}</pre>",
+                    parse_mode="HTML",
+                )
         except Exception:
             pass
 
@@ -316,13 +316,13 @@ async def cmd_ptmplatform_deploy(update: Update, context: ContextTypes.DEFAULT_T
     user_id = update.effective_user.id
     user_name = _user_display_name(update)
 
-    ok, deny_msg = acquire_lock(user_id, user_name)
+    ok, deny_msg = acquire_lock(user_id, user_name, scope="ptm")
     if not ok:
-        await update.message.reply_text(deny_msg, parse_mode="Markdown")
+        await update.message.reply_text(deny_msg)
         return
 
-    start_notice = f"🚀 *{user_name}*이(가) ptm-platform 배포를 시작했습니다"
-    await update.message.reply_text(start_notice, parse_mode="Markdown")
+    start_notice = f"🚀 {user_name}이(가) ptm-platform 배포를 시작했습니다"
+    await update.message.reply_text(start_notice)
     await _broadcast(update.get_bot(), start_notice, exclude_id=user_id)
 
     try:
@@ -333,9 +333,9 @@ async def cmd_ptmplatform_deploy(update: Update, context: ContextTypes.DEFAULT_T
     except Exception as e:
         result_msg = f"❌ 배포 중 예외: {str(e)[:300]}"
     finally:
-        release_lock()
+        release_lock(scope="ptm")
 
-    done_notice = f"*[ptm-platform 배포 결과 — {user_name}]*\n{result_msg}"
+    done_notice = f"[ptm-platform 배포 결과 — {user_name}]\n{result_msg}"
     await _telegram_reply_long_pre(update.message, done_notice)
     await _broadcast(update.get_bot(), done_notice[:3800], exclude_id=user_id)
 
@@ -366,49 +366,66 @@ async def cmd_ptmplatform_unlock(update: Update, context: ContextTypes.DEFAULT_T
     if not is_allowed(update.effective_user.id):
         return
     from tools.deploy_manager import get_lock_status, release_lock
-    lock = get_lock_status()
+    scope = "ptmquant" if (context.args and context.args[0].lower() in ("quant", "ptmquant")) else "ptm"
+    lock = get_lock_status(scope=scope)
     user_name = _user_display_name(update)
+    label = "PTMQuant" if scope == "ptmquant" else "ptm-platform"
     if lock:
         owner = lock.get("name", "?")
         elapsed = int(lock.get("elapsed", 0))
         mins, secs = divmod(elapsed, 60)
-        release_lock()
+        release_lock(scope=scope)
         msg = (
-            f"🔓 배포 락 해제됨\n"
+            f"🔓 {label} 배포 락 해제됨\n"
             f"기존 락: {owner} ({mins}분 {secs}초 전 시작)\n"
             f"해제한 사람: {user_name}"
         )
     else:
-        msg = "ℹ️ 현재 배포 락이 없습니다."
+        msg = f"ℹ️ 현재 {label} 배포 락이 없습니다."
     await update.message.reply_text(msg)
     await _broadcast(update.get_bot(), msg, exclude_id=update.effective_user.id)
 
 
 async def cmd_ptmquant_deploy(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """PTMQuant pull + build.sh 실행."""
+    """PTMQuant pull + build.sh 실행. 전용 락 (ptm-platform 과 독립)."""
     if not is_allowed(update.effective_user.id):
         return
     path = _ptmquant_path()
     if not path or not Path(path).exists():
         await update.message.reply_text(f"❌ PTMQuant 경로 없음: {path or '(미설정)'}")
         return
-    await update.message.reply_text(f"🚀 PTMQuant 배포 시작…\n📁 {path}")
+
+    from tools.deploy_manager import acquire_lock, release_lock
+    from tools.ptm import git_pull_only, run_script
+
+    user_id = update.effective_user.id
+    user_name = _user_display_name(update)
+    ok, deny_msg = acquire_lock(user_id, user_name, scope="ptmquant")
+    if not ok:
+        await update.message.reply_text(deny_msg)
+        return
+
+    start_notice = f"🚀 {user_name}이(가) PTMQuant 배포를 시작했습니다\n📁 {path}"
+    await update.message.reply_text(start_notice)
+    await _broadcast(update.get_bot(), start_notice, exclude_id=user_id)
+
     try:
-        from tools.ptm import git_pull_only, run_script
         pull_msg, pull_ok = await git_pull_only(path)
         if not pull_ok:
-            await update.message.reply_text(pull_msg[:4000])
-            return
-        pull_summary = pull_msg.splitlines()[-1] if pull_msg else ""
-        host_path = _ptmquant_host_path()
-        env_prefix = f'COMPOSE_PROJECT_DIR="{host_path}" ' if host_path else ""
-        build_msg, _ = await run_script(path, f"{env_prefix}./build.sh", timeout=900)
-        await _telegram_reply_long_pre(
-            update.message,
-            f"✅ PTMQuant 배포 완료\n📥 Pull: {pull_summary}\n🔨 Build:\n{build_msg}",
-        )
+            result_msg = pull_msg
+        else:
+            pull_summary = pull_msg.splitlines()[-1] if pull_msg else ""
+            host_path = _ptmquant_host_path()
+            env_prefix = f'COMPOSE_PROJECT_DIR="{host_path}" ' if host_path else ""
+            build_msg, _ = await run_script(path, f"{env_prefix}./build.sh", timeout=900)
+            result_msg = f"✅ PTMQuant 배포 완료\n📥 Pull: {pull_summary}\n🔨 Build:\n{build_msg}"
     except Exception as e:
-        await update.message.reply_text(f"오류: {str(e)[:500]}")
+        result_msg = f"오류: {str(e)[:500]}"
+    finally:
+        release_lock(scope="ptmquant")
+
+    await _telegram_reply_long_pre(update.message, result_msg)
+    await _broadcast(update.get_bot(), result_msg[:3800], exclude_id=user_id)
 
 
 async def log_telegram_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -506,22 +523,18 @@ async def post_init(app: Application):
         await app.bot.set_my_commands(cmds, language_code="ko")
     except Exception as e:
         print(f"⚠️ set_my_commands 실패 (Telegram 명령 메뉴 미반영 가능): {e}")
-    cron_admission = CONFIG.get("scheduler", {}).get("admission_check", "0 9 * * *")
-
-    from apscheduler.triggers.cron import CronTrigger
-    trigger_admission = CronTrigger.from_crontab(cron_admission)
-
-    # 짧은 지연(수 초)은 허용 → "missed by …" 로그 완화
-    _grace = {"misfire_grace_time": 120, "coalesce": True}
-
-    scheduler.add_job(
-        job_admission_check,
-        trigger_admission,
-        args=[app],
-        id="admission",
-        **_grace,
-    )
-    scheduler.start()
+    cron_admission = str((CONFIG.get("scheduler") or {}).get("admission_check") or "").strip()
+    if cron_admission:
+        from apscheduler.triggers.cron import CronTrigger
+        scheduler.add_job(
+            job_admission_check,
+            CronTrigger.from_crontab(cron_admission),
+            args=[app],
+            id="admission",
+            misfire_grace_time=120,
+            coalesce=True,
+        )
+        scheduler.start()
 
     # PTM Platform webhook 수신 서버 (포트 9000)
     webhook_cfg = CONFIG.get("webhook", {})
@@ -614,6 +627,7 @@ def _make_telegram_request(*, connection_pool_size: int) -> HTTPXRequest:
 
 def main():
     _configure_logging()
+    _acquire_single_instance_lock()
     # 일반 API / getUpdates 각각 전용 클라이언트 (pool_timeout 1초 기본은 끊김에 취약)
     req = _make_telegram_request(connection_pool_size=256)
     req_updates = _make_telegram_request(connection_pool_size=8)

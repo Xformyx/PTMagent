@@ -48,7 +48,7 @@ async def run_script(project_path: str, script: str, timeout: int = 600) -> Tupl
         output = out.decode("utf-8", errors="replace").strip()
         ok = proc.returncode == 0
         msg = "✅ 완료" if ok else "❌ 실패"
-        return f"{msg}\n```\n{output[-3000:]}\n```", ok
+        return f"{msg}\n{output[-3000:]}", ok
     except asyncio.TimeoutError:
         proc.kill()
         await proc.wait()
@@ -65,7 +65,7 @@ async def git_pull_only(project_path: str) -> Tuple[str, bool]:
     output = stdout + ("\n" + stderr if stderr else "")
     ok = code == 0
     msg = "✅ git pull 완료" if ok else "❌ git pull 실패"
-    body = f"{msg}\n```\n{output}\n```"
+    body = f"{msg}\n{output}"
     if not ok and _needs_credential_hint(output):
         body += _GIT_CREDENTIAL_HINT
     return body, ok
@@ -73,12 +73,11 @@ async def git_pull_only(project_path: str) -> Tuple[str, bool]:
 
 _GIT_CREDENTIAL_HINT = """
 
-💡 HTTPS private 저장소는 Docker(리눅스) 안에서 인증 입력창을 띄울 수 없습니다.
+💡 GitHub 인증 실패. 이 봇은 Mac에서 직접 실행됩니다.
 
-해결 방법:
-1) SSH 로 변경: git remote set-url origin git@github.com:Xformyx/REPO.git
-   docker-compose.yml 의 ~/.ssh 마운트 주석 해제 후 컨테이너 재생성.
-2) HTTPS 유지: PAT credential 파일 마운트 필요 (설정 복잡)."""
+1) remote가 SSH인지 확인: git remote -v
+2) 키 등록: ssh-add --apple-use-keychain ~/.ssh/id_ed25519_macstudio
+3) ~/.ssh/config 에 Host github.com / IdentityFile 이 있는지 확인"""
 
 
 def _needs_credential_hint(output: str) -> bool:

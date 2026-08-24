@@ -11,51 +11,64 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 
-LOCK_FILE = Path("/tmp/ptm_deploy.lock")
-LOCK_TIMEOUT_SEC = 600  # 10분 후 자동 만료
+LOCK_TIMEOUT_SEC = 1200  # 20분 — deploy/build 타임아웃(900초)보다 길게
+_UNLOCK_HINT = {
+    "ptm": "/ptmplatform_unlock",
+    "ptmquant": "/ptmplatform_unlock quant",
+}
+
+
+def _lock_file(scope: str = "ptm") -> Path:
+    if scope == "ptmquant":
+        return Path("/tmp/ptmquant_deploy.lock")
+    return Path("/tmp/ptm_deploy.lock")
 
 
 # ── 락 관리 ───────────────────────────────────────────────────────────────────
 
-def acquire_lock(user_id: int, user_name: str) -> Tuple[bool, str]:
-    """배포 락 획득 시도. (성공 여부, 실패 메시지) 반환."""
-    if LOCK_FILE.exists():
+def acquire_lock(user_id: int, user_name: str, scope: str = "ptm") -> Tuple[bool, str]:
+    """배포 락 획득 시도. scope=ptm | ptmquant. (성공 여부, 실패 메시지)."""
+    lock_file = _lock_file(scope)
+    if lock_file.exists():
         try:
-            data = json.loads(LOCK_FILE.read_text())
+            data = json.loads(lock_file.read_text())
             elapsed = time.time() - data.get("ts", 0)
             if elapsed < LOCK_TIMEOUT_SEC:
                 mins = int(elapsed // 60)
                 secs = int(elapsed % 60)
                 owner = data.get("name", f"ID {data.get('uid', '?')}")
+                hint = _UNLOCK_HINT.get(scope, "/ptmplatform_unlock")
                 return False, (
-                    f"🔒 *{owner}*이(가) 배포 중입니다 ({mins}분 {secs}초 전 시작)\n"
+                    f"🔒 {owner}이(가) 배포 중입니다 ({mins}분 {secs}초 전 시작)\n"
                     f"완료되면 자동으로 알림이 옵니다. 잠시 기다려 주세요.\n"
-                    f"강제 해제: /ptmplatform_unlock"
+                    f"강제 해제: {hint}"
                 )
         except Exception:
             pass  # 손상된 락 파일이면 덮어씌움
 
-    LOCK_FILE.write_text(json.dumps({
+    lock_file.write_text(json.dumps({
         "uid": user_id,
         "name": user_name,
         "ts": time.time(),
+        "scope": scope,
     }))
     return True, ""
 
 
-def release_lock() -> None:
-    LOCK_FILE.unlink(missing_ok=True)
+def release_lock(scope: str = "ptm") -> None:
+    _lock_file(scope).unlink(missing_ok=True)
 
 
-def get_lock_status() -> Optional[dict]:
+def get_lock_status(scope: str = "ptm") -> Optional[dict]:
     """현재 락 정보. 없거나 만료됐으면 None."""
-    if not LOCK_FILE.exists():
+    lock_file = _lock_file(scope)
+    if not lock_file.exists():
         return None
     try:
-        data = json.loads(LOCK_FILE.read_text())
+        data = json.loads(lock_file.read_text())
         elapsed = time.time() - data.get("ts", 0)
         if elapsed >= LOCK_TIMEOUT_SEC:
-            LOCK_FILE.unlink(missing_ok=True)
+            lock_file.unlink(missing_ok=True)
             return None
         data["elapsed"] = elapsed
         return data
@@ -120,7 +133,7 @@ async def smart_deploy(
     # 1) git pull
     pull_out, pull_ok = await _run(cwd, "git pull origin main")
     if not pull_ok:
-        return f"❌ git pull 실패\n```\n{pull_out[-2000:]}\n```", False
+        return f"❌ git pull 실패\n{pull_out[-2000:]}", False
 
     # pull 결과 요약 (Already up to date / N files changed)
     pull_summary = pull_out.splitlines()[-1] if pull_out else "(출력 없음)"
@@ -145,11 +158,35 @@ async def smart_deploy(
     return msg, deploy_ok
 
 
+def _which(cmd: str) -> str | None:
+    """PATH + 흔한 Mac 경로에서 실행 파일 찾기 (launchd 최소 PATH 대비)."""
+    import os
+    import shutil
+    extra = [
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+        "/usr/bin",
+        str(Path.home() / ".docker" / "bin"),
+    ]
+    path = os.environ.get("PATH", "")
+    merged = os.pathsep.join([p for p in extra if p] + ([path] if path else []))
+    found = shutil.which(cmd, path=merged)
+    if found:
+        return found
+    for folder in extra:
+        candidate = Path(folder) / cmd
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
+
+
 def _run_sync(args: list, cwd: str, timeout: int = 10) -> str:
     """동기 subprocess.run — asyncio 이벤트 루프와 무관하게 실행."""
     import os
     import subprocess
     env = os.environ.copy()
+    extra_path = "/opt/homebrew/bin:/usr/local/bin:/usr/bin"
+    env["PATH"] = extra_path + os.pathsep + env.get("PATH", "")
     env["GIT_TERMINAL_PROMPT"] = "0"
     env["GIT_PAGER"] = "cat"
     env["PAGER"] = "cat"
@@ -195,29 +232,34 @@ async def get_platform_status(project_path: str) -> dict:
         return {"error": f"❌ 경로 없음: {cwd}"}
 
     loop = asyncio.get_event_loop()
+    git_bin = _which("git") or "/usr/bin/git"
     git_out = await loop.run_in_executor(
         None,
         _run_sync,
-        ["/usr/bin/git", "--no-pager", "log", "--oneline", "-5"],
+        [git_bin, "--no-pager", "log", "--oneline", "-5"],
         cwd,
         5,
     )
     if git_out.startswith("⏱️") or git_out.startswith("❌"):
         git_out = _recent_commits_from_files(cwd)
 
-    docker_out = await loop.run_in_executor(
-        None,
-        _run_sync,
-        [
-            "/usr/local/bin/docker",
-            "compose",
-            "ps",
-            "--format",
-            "table {{.Name}}\t{{.Status}}",
-        ],
-        cwd,
-        5,
-    )
+    docker_bin = _which("docker")
+    if not docker_bin:
+        docker_out = "❌ docker 실행 파일을 찾지 못했습니다 (/opt/homebrew/bin, /usr/local/bin)."
+    else:
+        docker_out = await loop.run_in_executor(
+            None,
+            _run_sync,
+            [
+                docker_bin,
+                "compose",
+                "ps",
+                "--format",
+                "table {{.Name}}\t{{.Status}}",
+            ],
+            cwd,
+            5,
+        )
 
     lock = get_lock_status()
     if lock:
