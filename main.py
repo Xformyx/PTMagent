@@ -16,6 +16,8 @@ import asyncio
 import fcntl
 import logging
 import os
+import time
+from datetime import datetime, timezone
 from html import escape
 
 import httpx
@@ -72,6 +74,14 @@ def is_allowed(user_id: int) -> bool:
 
 INSTANCE_PID_FILE = Path("/tmp/ptm_agent.pid")
 _INSTANCE_LOCK_FD: int | None = None
+_AGENT_STARTED_AT_ISO: str | None = None
+_AGENT_STARTED_MONO: float | None = None
+
+
+def _mark_agent_started() -> None:
+    global _AGENT_STARTED_AT_ISO, _AGENT_STARTED_MONO
+    _AGENT_STARTED_MONO = time.monotonic()
+    _AGENT_STARTED_AT_ISO = datetime.now(timezone.utc).isoformat()
 
 
 def _acquire_single_instance_lock() -> None:
@@ -560,6 +570,7 @@ async def post_init(app: Application):
                 return ts or ""
 
         async def handle_webhook(request):
+            log = logging.getLogger("webhook.ptm")
             try:
                 body = await request.json()
                 if "status" in body and body.get("order_code"):
@@ -578,33 +589,67 @@ async def post_init(app: Application):
             except Exception:
                 text = (await request.text()) or "No message"
 
+            log.info("recv %s", str(text)[:300])
             for uid in notify_ids:
                 try:
                     await app.bot.send_message(chat_id=uid, text=str(text)[:4000])
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.warning("telegram uid=%s failed: %s", uid, e)
             return web.Response(text="OK")
 
         from aiohttp import web
         web_app = web.Application()
+
+        async def handle_health(_request):
+            uptime = None
+            if _AGENT_STARTED_MONO is not None:
+                uptime = int(time.monotonic() - _AGENT_STARTED_MONO)
+            return web.json_response(
+                {
+                    "status": "ok",
+                    "service": "openclaw-home",
+                    "pid": os.getpid(),
+                    "started_at": _AGENT_STARTED_AT_ISO,
+                    "uptime_seconds": uptime,
+                    "telegram_polling": True,
+                    "webhook_listen": f":{port}/webhook/ptm",
+                }
+            )
+
+        web_app.router.add_get("/health", handle_health)
         web_app.router.add_post("/webhook/ptm", handle_webhook)
         runner = web.AppRunner(web_app)
         await runner.setup()
-        site = web.TCPSite(runner, "0.0.0.0", port)
-        try:
-            await site.start()
-        except OSError as e:
-            if e.errno == 48:  # Address already in use
+        # Docker Desktop 의 host.docker.internal 은 IPv6 를 먼저 고른다.
+        # 0.0.0.0 만 열면 워커 웹훅이 ENETUNREACH 로 실패한다.
+        bound = []
+        for host in ("0.0.0.0", "::"):
+            site = web.TCPSite(runner, host, port)
+            try:
+                await site.start()
+                bound.append(host)
+            except OSError as e:
+                if e.errno == 48:  # Address already in use
+                    logging.getLogger("webhook.ptm").warning("port %s %s already in use", host, port)
+                    continue
+                if host == "::":
+                    continue
                 print(
-                    f"⚠️ Webhook 포트 {port} 사용 중 — PTM webhook 은 건너뜁니다. "
-                    "이미 봇이 떠 있으면 종료 후 하나만 실행하세요: pkill -f 'python main.py'"
+                    f"⚠️ Webhook 포트 {port} 사용 중 — PTM 오더 알림이 도착하지 않습니다. "
+                    "다른 서비스(예: MinIO)와 겹치면 config webhook.port 를 바꾸세요."
                 )
                 await runner.cleanup()
-            else:
-                raise
-        else:
+                bound = []
+                break
+        if bound:
             app.bot_data["webhook_runner"] = runner
-            print(f"📡 Webhook 수신: http://0.0.0.0:{port}/webhook/ptm")
+            logging.getLogger("webhook.ptm").info(
+                "listening on %s",
+                ", ".join(f"http://[{h}]:{port}/webhook/ptm" if ":" in h else f"http://{h}:{port}/webhook/ptm" for h in bound),
+            )
+            print(f"📡 Webhook 수신: :{port}/webhook/ptm ({', '.join(bound)})", flush=True)
+        else:
+            await runner.cleanup()
 
 
 def _make_telegram_request(*, connection_pool_size: int) -> HTTPXRequest:
@@ -628,6 +673,7 @@ def _make_telegram_request(*, connection_pool_size: int) -> HTTPXRequest:
 def main():
     _configure_logging()
     _acquire_single_instance_lock()
+    _mark_agent_started()
     # 일반 API / getUpdates 각각 전용 클라이언트 (pool_timeout 1초 기본은 끊김에 취약)
     req = _make_telegram_request(connection_pool_size=256)
     req_updates = _make_telegram_request(connection_pool_size=8)

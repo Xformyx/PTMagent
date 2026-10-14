@@ -39,10 +39,10 @@ translator:
 threads:
   search_query: "權喜原"  # 또는 username: "@username" (프로필 직접)
 
-# PTM Platform webhook 수신
+# PTM Platform webhook 수신 (호스트 9000 은 MinIO 등과 충돌할 수 있음)
 webhook:
   enabled: true
-  port: 9000
+  port: 9100
   notify_telegram_ids: [12345678]
 
 # PTM 플랫폼 (Mac Studio에서 실행)
